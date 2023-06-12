@@ -1,0 +1,30 @@
+[package]
+name = "openexecution-oe"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+axum = { version = "0.5.16", features = ["headers"] }
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+serde_json = "1.0"
+serde_derive = "1.0"
+serde_bytes = "0.11"
+futures = { version = "0.3"}
+jsonwebtoken = "8"
+serde = {version = "1.0", features = ["derive"] }
+hex = "0.4"
+clap = "2.33.3"
+ethereum-types = "0.14.1"
+chrono = "0.4"
+tokio-postgres = "0.7.8"
+
+[profile.highperf]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+incremental = false
