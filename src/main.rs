@@ -44,36 +44,21 @@ fn make_jwt(jwt_secret: Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> Stri
 
 }
 
-async fn make_auth_request(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, node: &Arc<Node>, payload: String) -> String {
+async fn make_auth_request(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, node: &Arc<Node>, payload: String) -> Result<String, Box<dyn Error>> {
     let timestamp = chrono::Utc::now().timestamp();
     let jwt = make_jwt(jwt_secret.clone(), &timestamp);
     
-    let resp = node.client
+    node.client
         .post(&node.url)
         .header("Authorization", jwt)
         .header("Content-Type", "application/json")
         .body(payload)
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_millis(2500))
         .send()
-        .await;
+        .await?
+        .text()
+        .await?
 
-    let resp = match resp {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("Unable to send request to {}: {}", node.url, e);
-            return axum::http::StatusCode::BAD_REQUEST.to_string();
-        }
-    };
-
-    let resp = match resp.text().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("Unable to get response from {}: {}", node.url, e);
-            return axum::http::StatusCode::BAD_REQUEST.to_string();
-        }
-    };
-
-    resp
 }   
 
 fn make_syncing_string(id: &u64) -> String {
