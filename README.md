@@ -1,3 +1,5 @@
 # openexecution-oe
 
-https://gist.github.com/zeljic/d8b542788b225b1bcb5fce169ee28c55
+
+todo:
+make it so oe passes the jwt from the canonical cl requests directly to the el instead of making it itself

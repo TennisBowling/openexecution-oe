@@ -3,14 +3,13 @@ use std::{sync::Arc, time::Duration, error::Error};
 use serde::{Serialize, Deserialize};
 use types::*;
 use jsonwebtoken;
-use futures;
 use axum::{
     self,
     response::IntoResponse,
-    Extension, Router, extract::DefaultBodyLimit, http::HeaderMap,
+    Extension, Router, extract::DefaultBodyLimit, http::StatusCode,
 };
 use tokio::sync::RwLock;
-use reqwest;
+use reqwest::{self};
 
 
 const DEFAULT_ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS256;
@@ -31,6 +30,7 @@ pub struct Node {
     pub client: reqwest::Client,
 }
 
+#[inline(always)]
 fn make_jwt(jwt_secret: Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> String {
 
     let claim_inst = Claims {
@@ -44,11 +44,12 @@ fn make_jwt(jwt_secret: Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> Stri
 
 }
 
+#[inline(always)]
 async fn make_auth_request(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, node: &Arc<Node>, payload: String) -> Result<String, Box<dyn Error>> {
     let timestamp = chrono::Utc::now().timestamp();
     let jwt = make_jwt(jwt_secret.clone(), &timestamp);
     
-    node.client
+    Ok(node.client
         .post(&node.url)
         .header("Authorization", jwt)
         .header("Content-Type", "application/json")
@@ -57,14 +58,36 @@ async fn make_auth_request(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, node: &A
         .send()
         .await?
         .text()
-        .await?
+        .await?)
 
 }   
 
-fn make_syncing_string(id: &u64) -> String {
-    format!(r#"{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{\"payloadStatus\":{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null},\"payloadId\":null}}"#, id)
+#[inline(always)]
+async fn make_unauth_request(node: &Arc<Node>, payload: String) -> Result<String, Box<dyn Error>> {
+    Ok(node.client
+        .post(&node.url)
+        .header("Content-Type", "application/json")
+        .body(payload)
+        .timeout(Duration::from_millis(2500))
+        .send()
+        .await?
+        .text()
+        .await?)
 }
 
+#[inline(always)]
+fn make_syncing_string(id: &u64) -> String {
+    format!(r#"{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"payloadStatus\":{{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null}},\"payloadId\":null}}}}"#, id)
+}
+
+#[inline(always)]
+fn extract_prefix(input: &str) -> &str {
+    if let Some(index) = input.find('_') {
+        &input[..=index]
+    } else {
+        input
+    }
+}
 
 
 #[derive(Clone)]
@@ -76,15 +99,18 @@ struct State {
     last_legitimate_fcu: Arc<RwLock<String>>,
 }
 
-async fn handle_client_fcU(body: &str, json: &serde_json::Value, state: &State) -> Result<String, Box<dyn Error>> {
+#[inline(always)]
+async fn handle_client_fcu(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
     // can be either fcUV1 or fcUV2, we dont care encode it as fcUV2
     let fcu = match serde_json::from_str::<forkchoiceUpdatedV2>(body) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("Unable to parse JSON: {}", e);
+            tracing::error!("Unable to parse fcU JSON from client: {}", e);
             return Err(Box::new(e));
         }
     };
+    
+
 
     if fcu.params.get(0).unwrap().payloadAttributes.is_some() {
         // client wants to build a block
@@ -108,19 +134,20 @@ async fn handle_client_fcU(body: &str, json: &serde_json::Value, state: &State) 
         drop(last_legitimate_fcu);
 
         // since the fcU is the same as the last legitimate one, we can just forward this request to the node
-        let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await;
+        let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
         return Ok(resp);
     }
 
     // try to get fcu from db 5 times, once we do, return the response
     // implem a 250ms delay between each try
+    let head_block_hash = fcu.params.get(0).unwrap().forkchoiceState.headBlockHash.to_string();
     for _ in 1..5 {
-        let fcu_from_db = state.db.query_one("SELECT response FROM fcu WHERE request = $1", &[&body]).await;
+        let fcu_from_db = state.db.query_one("SELECT response FROM fcu WHERE request = $1", &[&head_block_hash]).await;
         let fcu_from_db = match fcu_from_db {
             Ok(v) => v,
             Err(e) => {
                 tracing::error!("Unable to get fcu from db: {}", e);
-                return Ok("".to_owned());
+                return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot get fcU from db: check openexecution\"}}".into());
             }
         };
 
@@ -134,8 +161,8 @@ async fn handle_client_fcU(body: &str, json: &serde_json::Value, state: &State) 
         let fcu_from_db: forkchoiceUpdatedV1Response = match serde_json::from_str(&fcu_from_db) {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Unable to parse JSON: {}", e);
-                return Ok("".to_owned());
+                tracing::error!("Unable to parse fcU JSON from db: {}", e);
+                return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot parse fcU from db: check openexecution\"}}".into());
             }
         };
 
@@ -143,17 +170,251 @@ async fn handle_client_fcU(body: &str, json: &serde_json::Value, state: &State) 
 
     }
 
-    Ok("".to_owned())
+    // if we're here it means we didn't find the fcu in the db, so just respond SYNCING
+    Ok(make_syncing_string(&fcu.id))
+
 }
 
-async fn handle_client_cl(body: String, headers: HeaderMap, Extension(state): Extension<State>) -> impl IntoResponse {
-    let json: serde_json::Value = match serde_json::from_str(&body) {
+#[inline(always)]
+async fn handle_client_exchangeconfig(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
+    // just try and get the config from the db
+    // if we can't just return an error
+    
+    // json load the body
+    let exchange_config = match serde_json::from_str::<exchangeTransitionConfigurationV1>(body) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("Unable to parse JSON: {}", e);
-            return axum::http::StatusCode::BAD_REQUEST;
+            tracing::error!("Unable to parse exchangeConfig JSON from client: {}", e);
+            return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot parse exchangeConfig body request JSON\"}}".into());
         }
     };
+
+    // get the config from the db
+    let config_from_db = state.db.query_one("SELECT response FROM exchange_config WHERE request = '1'", &[]).await;
+
+    let config_from_db = match config_from_db {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Unable to get exchangeConfig from db: {}", e);
+            return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot get exchangeConfig from db: check openexecution\"}}".into());
+        }
+    };
+
+    let config_from_db: String = config_from_db.get(0);
+
+    // parse the config from the db
+    let config_from_db = match serde_json::from_str::<exchangeTransitionConfigurationV1>(&config_from_db) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Unable to parse exchangeConfig JSON from db: {}", e);
+            return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot parse exchangeConfig from db: check openexecution\"}}".into());
+        }
+    };
+
+    // set id and return
+    Ok(serde_json::to_string(&config_from_db.set_id(exchange_config.id)?)?)
+}
+
+#[inline(always)]
+async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
+    // for newPayload, we try to find a response in the db. if we don't we can forward the request to the auth node and save the response in the db only if the response is syncing
+
+    // json load the body
+    let new_payload = match serde_json::from_str::<newPayloadV2>(body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Unable to parse newPayload JSON from client: {}", e);
+            return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot parse newPayload body request JSON\"}}".into());
+        }
+    };
+
+    // get the payload from the db
+    let payload_from_db = state.db.query_one("SELECT response FROM newPayload WHERE request = $1", &[&new_payload.params.get(0).unwrap().blockHash.to_string()]).await;
+
+    let payload_from_db = match payload_from_db {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Unable to get newPayload from db: {}", e);
+            return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot get newPayload from db: check openexecution\"}}".into());
+        }
+    };
+
+    if payload_from_db.is_empty() {
+        // we didn't find the payload in the db, so we forward the request to the auth node
+        let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+        let resp_json: newPayloadV1Response = serde_json::from_str(&resp)?;
+
+        // if the response is syncing, we save it in the db
+        
+        match resp_json.result.status {
+            ExecutionStatus::VALID => {
+                // save the response in the db
+                state.db.execute("INSERT INTO newPayload (request, response) VALUES ($1, $2)", &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp.to_string()]).await?;
+            },
+            _ => {} // we dont save the response in the db
+        }
+
+        return Ok(serde_json::to_string(&resp_json.set_id(new_payload.id)?)?);
+    }
+
+    // we found the payload in the db, so we just return it
+    let payload_from_db: String = payload_from_db.get(0);
+    let payload_from_db: newPayloadV1Response = serde_json::from_str(&payload_from_db)?;
+
+    Ok(serde_json::to_string(&payload_from_db.set_id(new_payload.id)?)?)
+}
+
+
+#[inline(always)]
+async fn handle_client_passto_auth(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
+    // we can just pass these requests to the auth node
+
+    Ok(make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?)
+
+}
+
+#[inline(always)]
+async fn handle_client_passto_unauth(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
+    // we can just pass these requests to the unauth node
+
+    Ok(make_unauth_request(&state.unauth_node, body.to_owned()).await?)
+
+}
+
+
+
+async fn handle_client_cl(body: String, Extension(state): Extension<State>) -> impl IntoResponse {
+    // load json into a Value
+    let json_body: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Unable to parse JSON from client: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":{\"code\":-32000,\"message\":\"Cannot parse body request JSON\"}}",
+            ).into_response();
+        }
+    };
+
+    // match the method to the correct handler
+    // just leave the actual matches todo
+
+    let method = match json_body.get("method") {
+        Some(v) => v,
+        None => {
+            tracing::error!("Unable to get method from client request");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":{\"code\":-32000,\"message\":\"Cannot get method from body request JSON\"}}",
+            ).into_response();
+        }
+    };
+
+    let method = match method.as_str() {
+        Some(v) => v,
+        None => {
+            tracing::error!("Unable to parse method from client request");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":{\"code\":-32000,\"message\":\"Cannot parse method from body request JSON\"}}",
+            ).into_response();
+        }
+    };
+
+    let method_semi = extract_prefix(method);
+
+    match method_semi {
+
+        "engine_" => {
+            match method {
+                "engine_forkchoiceUpdatedV1" | "engine_forkchoiceUpdatedV2" => {
+                    match handle_client_fcu(&body, &state).await {
+                        Ok(v) => return (StatusCode::OK, v).into_response(),
+                        Err(e) => {
+                            tracing::error!("Unable to handle client request: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                            ).into_response();
+                        }
+                    }
+                },
+
+                "engine_exchangeTransitionConfigurationV1" => {
+                    match handle_client_exchangeconfig(&body, &state).await {
+                        Ok(v) => return (StatusCode::OK, v).into_response(),
+                        Err(e) => {
+                            tracing::error!("Unable to handle client request: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                            ).into_response();
+                        }
+                    }
+                },
+                
+                "engine_newPayloadV1" | "engine_newPayloadV2" => {
+                    match handle_client_newpayload(&body, &state).await {
+                        Ok(v) => return (StatusCode::OK, v).into_response(),
+                        Err(e) => {
+                            tracing::error!("Unable to handle client request: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                            ).into_response();
+                        }
+                    }
+                },
+                
+                "engine_getPayloadV1" |
+                "engine_getPayloadV2" |
+                "engine_getPayloadBodiesByHashV1" |
+                "engine_getPayloadBodiesByRangeV1" |
+                "engine_exchangeCapabilities" => {
+                    match handle_client_passto_auth(&body, &state).await {
+                        Ok(v) => return (StatusCode::OK, v).into_response(),
+                        Err(e) => {
+                            tracing::error!("Unable to handle client request: {}", e);
+                            return (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                            ).into_response();
+                        }
+                    }
+                },
+
+                _ => {
+                    tracing::error!("Unable to match engine method from client request");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "{\"error\":{\"code\":-32000,\"message\":\"Cannot match engine method from body request JSON\"}}",
+                    ).into_response();
+                }
+            }
+        },
+
+        "web3_" | "eth_" | "net_" => {
+            match handle_client_passto_unauth(&body, &state).await {
+                Ok(v) => return (StatusCode::OK, v).into_response(),
+                Err(e) => {
+                    tracing::error!("Unable to handle client request: {}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                    ).into_response();
+                }
+            }
+        },
+
+        _ => {
+            tracing::error!("Unable to match method from client request");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":{\"code\":-32000,\"message\":\"Cannot match method from body request JSON\"}}",
+            ).into_response();
+        }
+    }
+
 
 
 }
@@ -332,7 +593,7 @@ async fn main() {
     ).await.expect("Unable to create exchangeconfig table");
     
 
-    let mut last_legitimate_fcu = String::new();
+    let last_legitimate_fcu = String::new();
 
     
     // make the state

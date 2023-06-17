@@ -40,24 +40,6 @@ pub struct PayloadAttributesV2 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionPayloadV1 {
-    pub parentHash: H256,
-    pub feeRecipient: Address,
-    pub stateRoot: H256,
-    pub receiptsRoot: H256,
-    pub logsBloom: String,
-    pub prevRandao: H256,
-    pub blockNumber: u64,
-    pub gasLimit: u64,
-    pub gasUsed: u64,
-    pub timestamp: u64,
-    pub extraData: Vec<u8>,
-    pub baseFeePerGas: U256,
-    pub blockHash: H256,
-    pub transactions: Vec<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionPayloadV2 {
     pub parentHash: H256,
     pub feeRecipient: Address,
@@ -73,7 +55,7 @@ pub struct ExecutionPayloadV2 {
     pub baseFeePerGas: U256,
     pub blockHash: H256,
     pub transactions: Vec<Vec<u8>>,
-    pub withdrawls: Vec<WithdrawlV1>,
+    pub withdrawls: Option<Vec<WithdrawlV1>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +97,7 @@ pub struct forkchoiceUpdatedV1Response {
 }
 
 impl forkchoiceUpdatedV1Response {
+    #[inline(always)]
     pub fn to_db(&self) -> Result<String, Box<dyn Error>> {
         // we have to remove the id field
         let mut fcu = self.clone();
@@ -123,6 +106,7 @@ impl forkchoiceUpdatedV1Response {
         Ok(json)
     }
 
+    #[inline(always)]
     pub fn set_id(&self, id: u64) -> Result<Self, Box<dyn Error>> {
         // we have to set the id field
         let mut fcu = self.clone();
@@ -133,24 +117,6 @@ impl forkchoiceUpdatedV1Response {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct newPayloadV1 {
-    pub jsonrpc: String,
-    pub id: u64,
-    pub method: String,
-    pub params: Vec<ExecutionPayloadV1>,
-}
-
-impl newPayloadV1 {
-    pub fn to_db(&self) -> Result<String, Box<dyn Error>> {
-        // we have to remove the id field
-        let mut fcu = self.clone();
-        fcu.id = 0;
-        let json = serde_json::to_string(&fcu)?;
-        Ok(json)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct newPayloadV1Response {
     pub jsonrpc: String,
     pub id: u64,
@@ -159,6 +125,7 @@ pub struct newPayloadV1Response {
 }
 
 impl newPayloadV1Response {
+    #[inline(always)]
     pub fn to_db(&self) -> Result<String, Box<dyn Error>> {
         // we have to remove the id field
         let mut fcu = self.clone();
@@ -167,7 +134,8 @@ impl newPayloadV1Response {
         Ok(json)
     }
 
-    pub fn to_client(&self, id: u64) -> Result<String, Box<dyn Error>> {
+    #[inline(always)]
+    pub fn set_id(&self, id: u64) -> Result<String, Box<dyn Error>> {
         // we have to set the id field
         let mut fcu = self.clone();
         fcu.id = id;
@@ -197,6 +165,7 @@ pub struct forkchoiceUpdatedV2 {
 }
 
 impl forkchoiceUpdatedV2 {
+    #[inline(always)]
     pub fn to_db(&self) -> Result<String, Box<dyn Error>> {
         // we have to remove the id field
         let mut fcu = self.clone();
@@ -210,18 +179,11 @@ impl forkchoiceUpdatedV2 {
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ExecutionPayload {
-    V1(ExecutionPayloadV1),
-    V2(ExecutionPayloadV2),
-}
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct newPayloadV2 {
     pub jsonrpc: String,
     pub id: u64,
     pub method: String,
-    pub params: Vec<ExecutionPayload>,
+    pub params: Vec<ExecutionPayloadV2>,
 }
 
 // response for newPayloadV2 is the same as newPayloadV1
@@ -236,6 +198,7 @@ pub struct exchangeTransitionConfigurationV1 {
 }
 
 impl exchangeTransitionConfigurationV1 {
+    #[inline(always)]
     pub fn to_db(&self) -> Result<String, Box<dyn Error>> {
         // we have to remove the id field
         let mut fcu = self.clone();
@@ -244,11 +207,26 @@ impl exchangeTransitionConfigurationV1 {
         Ok(json)
     }
 
-    pub fn to_client(&self, id: u64) -> Result<String, Box<dyn Error>> {
+    #[inline(always)]
+    pub fn set_id(&self, id: u64) -> Result<String, Box<dyn Error>> {
         // we have to set the id field
         let mut fcu = self.clone();
         fcu.id = id;
         let json = serde_json::to_string(&fcu)?;
         Ok(json)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RequestMethod {
+    engine_ForkchoiceUpdatedV1,
+    engine_ForkchoiceUpdatedV2,
+    engine_NewPayloadV1,
+    engine_NewPayloadV2,
+    engine_getPayloadV1,
+    engine_getPayloadV2,
+    engine_getPayloadBodiesByHashV1,
+    engine_getPayloadBodiesByRangeV1,
+    engine_exchangeCapabilities,
+    engine_exchangeTransitionConfigurationV1,
 }
