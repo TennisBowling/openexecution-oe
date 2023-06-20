@@ -2,59 +2,55 @@
 #![allow(non_camel_case_types)]
 
 
-use ethereum_types::{Address, H256, U256};
 use serde::{Deserialize, Serialize};
-use std::error::Error;
+use tokio::sync::RwLock;
+use std::{error::Error, sync::Arc};
+
+use crate::Node;
 
 
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WithdrawlV1 {
-    pub index: u64,
-    pub validatorIndex: u64,
-    pub address: Address,
-    pub amount: u64,
+    pub index: String,
+    pub validatorIndex: String,
+    pub address: String,
+    pub amount: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForkchoiceStateV1 {
-    pub headBlockHash: H256,
-    pub safeBlockHash: H256,
-    pub finalizedBlockHash: H256,
+    pub headBlockHash: String,
+    pub safeBlockHash: String,
+    pub finalizedBlockHash: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PayloadAttributesV1 {
-    pub timestamp: u64,
-    pub prevRandao: H256,
-    pub suggestedFeeRecipient: Address,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PayloadAttributesV2 {
-    pub timestamp: u64,
-    pub prevRandao: H256,
-    pub suggestedFeeRecipient: Address,
+    pub timestamp: String,
+    pub prevRandao: String,
+    pub suggestedFeeRecipient: String,
     pub withdrawls: Option<Vec<WithdrawlV1>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionPayloadV2 {
-    pub parentHash: H256,
-    pub feeRecipient: Address,
-    pub stateRoot: H256,
-    pub receiptsRoot: H256,
+    pub parentHash: String,
+    pub feeRecipient: String,
+    pub stateRoot: String,
+    pub receiptsRoot: String,
     pub logsBloom: String,
-    pub prevRandao: H256,
-    pub blockNumber: u64,
-    pub gasLimit: u64,
-    pub gasUsed: u64,
-    pub timestamp: u64,
-    pub extraData: Vec<u8>,
-    pub baseFeePerGas: U256,
-    pub blockHash: H256,
-    pub transactions: Vec<Vec<u8>>,
+    pub prevRandao: String,
+    pub blockNumber: String,
+    pub gasLimit: String,
+    pub gasUsed: String,
+    pub timestamp: String,
+    pub extraData: String,
+    pub baseFeePerGas: String,
+    pub blockHash: String,
+    pub transactions: Vec<String>,
     pub withdrawls: Option<Vec<WithdrawlV1>>,
 }
 
@@ -69,30 +65,24 @@ pub enum ExecutionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionConfigurationV1 {
-    terminalTotalDifficulty: U256,
-    terminalBlockHash: H256,
-    terminalBlockNumber: u64,
+    terminalTotalDifficulty: String,
+    terminalBlockHash: String,
+    terminalBlockNumber: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct payloadStatusV1 {
     pub status: ExecutionStatus,
-    pub latestValidHash: H256,
+    pub latestValidHash: String,
     pub ValidationError: Option<String>,
 }
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct forkchoiceUpdatedV1ResponseResult {
-    pub payloadStatus: payloadStatusV1,
-    pub payloadId: Option<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct forkchoiceUpdatedV1Response {
     pub jsonrpc: String,
     pub id: u64,
-    pub result: Vec<forkchoiceUpdatedV1ResponseResult>,
+    pub result: (payloadStatusV1, Option<String>),
     pub error: Option<String>,
 }
 
@@ -107,11 +97,12 @@ impl forkchoiceUpdatedV1Response {
     }
 
     #[inline(always)]
-    pub fn set_id(&self, id: u64) -> Result<Self, Box<dyn Error>> {
+    pub fn set_id(&self, id: u64) -> Result<String, Box<dyn Error>> {
         // we have to set the id field
         let mut fcu = self.clone();
         fcu.id = id;
-        Ok(fcu)
+        let json = serde_json::to_string(&fcu)?;
+        Ok(json)
     }
 }
 
@@ -144,35 +135,31 @@ impl newPayloadV1Response {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PayloadAttributes {
-    V1(PayloadAttributesV1),
-    V2(PayloadAttributesV2),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ForkchoiceUpdatedV2Params {
-    pub forkchoiceState: ForkchoiceStateV1,
-    pub payloadAttributes: Option<PayloadAttributes>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct forkchoiceUpdatedV2 {
     pub jsonrpc: String,
     pub id: u64,
     pub method: String,
-    pub params: Vec<ForkchoiceUpdatedV2Params>,
+    pub params: (ForkchoiceStateV1, Option<PayloadAttributesV2>),
 }
 
 impl forkchoiceUpdatedV2 {
     #[inline(always)]
     pub fn to_db(&self) -> Result<String, Box<dyn Error>> {
-        // we have to remove the id field
+        // we have to remove the id field and if present remove the payloadAttributes
         let mut fcu = self.clone();
         fcu.id = 0;
+
+        if fcu.params.1.is_some() {
+            fcu.params.1 = None;
+        }
+
         let json = serde_json::to_string(&fcu)?;
         Ok(json)
     }
+
+
 }
 
 // respose for forkchoiceUpdatedV2 is the same as forkchoiceUpdatedV1
@@ -193,8 +180,9 @@ pub struct newPayloadV2 {
 pub struct exchangeTransitionConfigurationV1 {
     pub jsonrpc: String,
     pub id: u64,
-    pub method: String,
-    pub params: Vec<TransitionConfigurationV1>,
+    pub method: Option<String>,
+    pub params: Option<Vec<TransitionConfigurationV1>>,
+    pub result: Option<TransitionConfigurationV1>,
 }
 
 impl exchangeTransitionConfigurationV1 {
@@ -229,4 +217,13 @@ pub enum RequestMethod {
     engine_getPayloadBodiesByRangeV1,
     engine_exchangeCapabilities,
     engine_exchangeTransitionConfigurationV1,
+}
+
+#[derive(Clone)]
+pub struct State {
+    pub db: Arc<tokio_postgres::Client>,
+    pub jwt_secret: Arc<jsonwebtoken::EncodingKey>,
+    pub auth_node: Arc<Node>,
+    pub unauth_node: Arc<Node>,
+    pub last_legitimate_fcu: Arc<RwLock<Vec<String>>>,  // first should be req second should be res
 }
