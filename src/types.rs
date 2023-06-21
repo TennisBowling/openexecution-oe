@@ -73,16 +73,23 @@ pub struct TransitionConfigurationV1 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct payloadStatusV1 {
     pub status: ExecutionStatus,
-    pub latestValidHash: String,
+    pub latestValidHash: Option<String>,
     pub ValidationError: Option<String>,
 }
 
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct forkchoiceUpdatedV1ResponseResult {
+    pub payloadStatus: payloadStatusV1,
+    pub payloadId: Option<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct forkchoiceUpdatedV1Response {
     pub jsonrpc: String,
     pub id: u64,
-    pub result: (payloadStatusV1, Option<String>),
+    pub result: forkchoiceUpdatedV1ResponseResult,
     pub error: Option<String>,
 }
 
