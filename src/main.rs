@@ -362,7 +362,8 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
 
         // put in db
         let resp_json_fordb = resp_json.clone().to_db()?;
-        state.db.execute("INSERT INTO newpayload (request, response) VALUES ($1, $2);", &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp_json_fordb]).await?;
+        state.db.execute("INSERT INTO fcu (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = EXCLUDED.response;",
+        &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp_json_fordb]).await?;
 
         return Ok(resp);
     }
@@ -849,17 +850,17 @@ async fn main() {
     // create tables if they don't exist
 
     client.query(
-        "CREATE TABLE IF NOT EXISTS fcu (request TEXT NOT NULL UNIQUE, response TEXT NOT NULL UNIQUE);",
+        "CREATE TABLE IF NOT EXISTS fcu (request TEXT NOT NULL UNIQUE, response TEXT NOT NULL);",
         &[],
     ).await.expect("Unable to create fcu table");
 
     client.query(
-        "CREATE TABLE IF NOT EXISTS newpayload (request TEXT NOT NULL UNIQUE, response TEXT NOT NULL UNIQUE);",
+        "CREATE TABLE IF NOT EXISTS newpayload (request TEXT NOT NULL UNIQUE, response TEXT NOT NULL);",
         &[],
     ).await.expect("Unable to create newpayload table");
 
     client.query(
-        "CREATE TABLE IF NOT EXISTS exchangeconfig (response TEXT NOT NULL UNIQUE);",
+        "CREATE TABLE IF NOT EXISTS exchangeconfig (response TEXT NOT NULL);",
         &[],
     ).await.expect("Unable to create exchangeconfig table");
 
