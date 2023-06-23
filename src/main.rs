@@ -256,7 +256,7 @@ async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, B
             ExecutionStatus::VALID => {
                 // save the response in the db
                 let resp_json_fordb = resp_json.clone().to_db()?;
-                state.db.execute("INSERT INTO newpayload (request, response) VALUES ($1, $2);", &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp_json_fordb]).await?;
+                state.db.execute("INSERT INTO newpayload (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = $2;;", &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp_json_fordb]).await?;
             },
             _ => {} // we dont save the response in the db
         }
@@ -327,7 +327,7 @@ async fn handle_canonical_fcu(body: &str, state: &State) -> Result<String, Box<d
         ExecutionStatus::INVALID_BLOCK_HASH => {},
     }
 
-    state.db.execute("INSERT INTO fcu (request, response) VALUES ($1, $2);", &[&req_json_fordb, &resp_json_fordb]).await?;
+    state.db.execute("INSERT INTO fcu (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = $2;;", &[&req_json_fordb, &resp_json_fordb]).await?;
 
     Ok(resp)
 }
@@ -362,7 +362,7 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
 
         // put in db
         let resp_json_fordb = resp_json.clone().to_db()?;
-        state.db.execute("INSERT INTO fcu (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = EXCLUDED.response;",
+        state.db.execute("INSERT INTO newpayload (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = $2;",
         &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp_json_fordb]).await?;
 
         return Ok(resp);
