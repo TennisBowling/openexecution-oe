@@ -77,7 +77,7 @@ async fn make_unauth_request(node: &Arc<Node>, payload: String) -> Result<String
 
 #[inline(always)]
 fn make_syncing_string(id: &u64) -> String {
-    format!(r#"{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"payloadStatus\":{{\"status\":\"SYNCING\",\"latestValidHash\":null,\"validationError\":null}},\"payloadId\":null}}}}"#, id)
+    format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"payloadStatus":{{"status":"SYNCING","latestValidHash":null,"validationError":null}},"payloadId":null}}}}"#, id)
 }
 
 #[inline(always)]
