@@ -1,5 +1,5 @@
 mod types;
-use std::{sync::Arc, time::Duration, error::Error, fs::{self, OpenOptions}};
+use std::{sync::Arc, time::Duration, error::Error, fs::{OpenOptions}};
 use std::io::Write;
 use serde::{Serialize, Deserialize};
 use types::*;
@@ -303,7 +303,7 @@ async fn handle_canonical_fcu(body: &str, state: &State) -> Result<String, Box<d
     if let Err(e) = resp_json {
         tracing::error!("Unable to parse forkchoiceUpdated response JSON from auth node: {}", e);
         let mut file = OpenOptions::new().append(true).open("error.log").unwrap();
-        writeln!(file, "{}", format!("fcu req: {}\nfcu resp: {}\n\n", body, resp));
+        let _ = writeln!(file, "{}", format!("fcu req: {}\nfcu resp: {}\n\n", body, resp));
         return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot parse forkchoiceUpdated response JSON from auth node\"}}".into());
     }
 
