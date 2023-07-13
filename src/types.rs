@@ -1,17 +1,17 @@
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
-
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
+use std::{
+    error::Error,
+    io,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::RwLock;
-use std::{error::Error, sync::Arc};
+use tracing_subscriber::fmt::writer::MakeWriter;
 
-use crate::Node;
-
-
-
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WithdrawlV1 {
     pub index: String,
     pub validatorIndex: String,
@@ -19,15 +19,14 @@ pub struct WithdrawlV1 {
     pub amount: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ForkchoiceStateV1 {
     pub headBlockHash: String,
     pub safeBlockHash: String,
     pub finalizedBlockHash: String,
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PayloadAttributesV2 {
     pub timestamp: String,
     pub prevRandao: String,
@@ -77,8 +76,6 @@ pub struct payloadStatusV1 {
     pub ValidationError: Option<String>,
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct forkchoiceUpdatedV1ResponseResult {
     pub payloadStatus: payloadStatusV1,
@@ -113,7 +110,6 @@ impl forkchoiceUpdatedV1Response {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct newPayloadV1Response {
     pub jsonrpc: String,
@@ -142,8 +138,7 @@ impl newPayloadV1Response {
     }
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct forkchoiceUpdatedV2 {
     pub jsonrpc: String,
     pub id: u64,
@@ -165,12 +160,9 @@ impl forkchoiceUpdatedV2 {
         let json = serde_json::to_string(&fcu)?;
         Ok(json)
     }
-
-
 }
 
 // respose for forkchoiceUpdatedV2 is the same as forkchoiceUpdatedV1
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct newPayloadV2 {
@@ -181,7 +173,6 @@ pub struct newPayloadV2 {
 }
 
 // response for newPayloadV2 is the same as newPayloadV1
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct exchangeTransitionConfigurationV1 {
@@ -232,5 +223,63 @@ pub struct State {
     pub jwt_secret: Arc<jsonwebtoken::EncodingKey>,
     pub auth_node: Arc<Node>,
     pub unauth_node: Arc<Node>,
-    pub last_legitimate_fcu: Arc<RwLock<Vec<String>>>,  // first should be req second should be res
+    pub last_legitimate_fcu: Arc<RwLock<Option<fcu_pair>>>, // first should be req second should be res
+}
+
+#[derive(Debug, Clone)]
+pub struct fcu_pair {
+    pub req: forkchoiceUpdatedV2,
+    pub resp: forkchoiceUpdatedV1Response,
+}
+
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub url: String,
+    pub client: reqwest::Client,
+}
+
+// custom writer that writes to multiple writers
+pub struct MultiWriter<W1> {
+    pub writer1: Arc<Mutex<W1>>,
+}
+
+impl<W1> MultiWriter<W1>
+where
+    W1: std::io::Write,
+{
+    pub fn new(writer1: Arc<Mutex<W1>>) -> Self {
+        MultiWriter { writer1 }
+    }
+}
+
+impl<W1> std::io::Write for MultiWriter<W1>
+where
+    W1: std::io::Write,
+{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut writer1 = self.writer1.lock().unwrap();
+        let len1 = writer1.write(buf)?;
+        Ok(len1)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut writer1 = self.writer1.lock().unwrap();
+        writer1.flush()?;
+        Ok(())
+    }
+}
+
+impl<'a, W1> MakeWriter<'a> for MultiWriter<W1>
+where
+    W1: std::io::Write + Send + Sync + 'static,
+{
+    type Writer = MultiWriter<W1>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        MultiWriter::new(self.writer1.clone())
+    }
+
+    fn make_writer_for(&'a self, _: &tracing::Metadata<'_>) -> Self::Writer {
+        MultiWriter::new(self.writer1.clone())
+    }
 }

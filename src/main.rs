@@ -1,17 +1,21 @@
 mod types;
-use std::{sync::Arc, time::Duration, error::Error, fs::{OpenOptions}};
-use std::io::Write;
-use serde::{Serialize, Deserialize};
-use types::*;
-use jsonwebtoken;
 use axum::{
-    self,
-    response::IntoResponse, Router, extract::DefaultBodyLimit, http::StatusCode,
-    debug_handler
+    self, debug_handler, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse,
+    Router,
+};
+use jsonwebtoken;
+use reqwest;
+use serde::{Deserialize, Serialize};
+use std::{
+    error::Error,
+    fs::OpenOptions,
+    io::Write,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::sync::RwLock;
-use reqwest::{self};
-
+use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use types::*;
 
 const DEFAULT_ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS256;
 
@@ -25,50 +29,51 @@ pub struct Claims {
     clv: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct Node {
-    pub url: String,
-    pub client: reqwest::Client,
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2500);
+
+#[inline(always)]
+fn make_jwt(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> String {
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(DEFAULT_ALGORITHM),
+        &Claims {
+            iat: timestamp.to_owned(),
+            id: "1".to_owned(),
+            clv: "1".to_owned(),
+        },
+        &jwt_secret,
+    )
+    .unwrap()
 }
 
 #[inline(always)]
-fn make_jwt(jwt_secret: Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> String {
+async fn make_auth_request(
+    jwt_secret: &Arc<jsonwebtoken::EncodingKey>,
+    node: &Arc<Node>,
+    payload: String,
+) -> Result<String, Box<dyn Error>> {
+    let jwt = make_jwt(jwt_secret, &chrono::Utc::now().timestamp());
 
-    let claim_inst = Claims {
-        iat: timestamp.to_owned(),
-        id: "1".to_owned(),
-        clv: "1".to_owned(),
-    };
-
-    let header = jsonwebtoken::Header::new(DEFAULT_ALGORITHM);
-    jsonwebtoken::encode(&header, &claim_inst, &jwt_secret).unwrap()
-
-}
-
-#[inline(always)]
-async fn make_auth_request(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, node: &Arc<Node>, payload: String) -> Result<String, Box<dyn Error>> {
-    let jwt = make_jwt(jwt_secret.clone(), &chrono::Utc::now().timestamp());
-    
-    Ok(node.client
+    Ok(node
+        .client
         .post(&node.url)
         .header("Authorization", format!("Bearer {}", jwt))
         .header("Content-Type", "application/json")
         .body(payload)
-        .timeout(Duration::from_millis(2500))
+        .timeout(DEFAULT_TIMEOUT)
         .send()
         .await?
         .text()
         .await?)
-
-}   
+}
 
 #[inline(always)]
 async fn make_unauth_request(node: &Arc<Node>, payload: String) -> Result<String, Box<dyn Error>> {
-    Ok(node.client
+    Ok(node
+        .client
         .post(&node.url)
         .header("Content-Type", "application/json")
         .body(payload)
-        .timeout(Duration::from_millis(2500))
+        .timeout(DEFAULT_TIMEOUT)
         .send()
         .await?
         .text()
@@ -77,7 +82,10 @@ async fn make_unauth_request(node: &Arc<Node>, payload: String) -> Result<String
 
 #[inline(always)]
 fn make_syncing_string(id: &u64) -> String {
-    format!(r#"{{"jsonrpc":"2.0","id":{},"result":{{"payloadStatus":{{"status":"SYNCING","latestValidHash":null,"validationError":null}},"payloadId":null}}}}"#, id)
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":{{"payloadStatus":{{"status":"SYNCING","latestValidHash":null,"validationError":null}},"payloadId":null}}}}"#,
+        id
+    )
 }
 
 #[inline(always)]
@@ -89,9 +97,6 @@ fn extract_prefix(input: &str) -> &str {
     }
 }
 
-
-
-
 #[inline(always)]
 async fn handle_client_fcu(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
     // can be either fcUV1 or fcUV2, we dont care encode it as fcUV2
@@ -102,8 +107,6 @@ async fn handle_client_fcu(body: &str, state: &State) -> Result<String, Box<dyn 
             return Err(Box::new(e));
         }
     };
-    
-
 
     if fcu.params.1.is_some() {
         // client wants to build a block
@@ -114,36 +117,44 @@ async fn handle_client_fcu(body: &str, state: &State) -> Result<String, Box<dyn 
         let mut fcu_no_payload = fcu.clone();
         fcu_no_payload.params.1 = None;
         fcu_no_payload.id = 0;
-        let fcu_no_payload_string = serde_json::to_string(&fcu_no_payload).unwrap();
 
         let last_legitimate_fcu = state.last_legitimate_fcu.read().await;
-
-        if last_legitimate_fcu.contains(&fcu_no_payload_string) {
-            // we can just forward this request to the node
-            let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
-            return Ok(resp);
-        }
-        else {
-            // return an error since we can't pass a blockbuild request if they have a weird fcu
-            let resp = make_syncing_string(&fcu.id);
-            return Ok(resp);
+        if let Some(last_fcu) = &*last_legitimate_fcu {
+            if last_fcu.req == fcu_no_payload {
+                // we can just forward this request to the node
+                let resp =
+                    make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+                return Ok(resp);
+            } else {
+                // return an error since we can't pass a blockbuild request if they have a weird fcu
+                let resp = make_syncing_string(&fcu.id);
+                return Ok(resp);
+            }
         }
     }
 
     // try to get fcu from db 5 times, once we do, return the response
     // implem a 250ms delay between each try
-    let db_key = fcu.to_db()?;
+    let mut db_key = fcu.clone();
+    db_key.id = 0;
     for _ in 1..5 {
         // we can try getting it from last_legitimate_fcu. try to find the request in the vec, if it's there get vec[1] for resp
         let last_legitimate_fcu = state.last_legitimate_fcu.read().await;
-        if last_legitimate_fcu.contains(&db_key) {
-            let resp = last_legitimate_fcu.get(1).unwrap().clone();
-            return Ok(resp);
+        if let Some(last_fcu) = &*last_legitimate_fcu {
+            if last_fcu.req == db_key {
+                return Ok(serde_json::to_string(&last_fcu.resp)?);
+            }
         }
         // if we're here we didnt find it so just drop it
         drop(last_legitimate_fcu);
 
-        let fcu_from_db = state.db.query_opt("SELECT response FROM fcu WHERE request = $1;", &[&db_key]).await;
+        let fcu_from_db = state
+            .db
+            .query_opt(
+                "SELECT response FROM fcu WHERE request = $1;",
+                &[&serde_json::to_string(&db_key)?],
+            )
+            .await;
         let fcu_from_db = match fcu_from_db {
             Ok(v) => v,
             Err(e) => {
@@ -168,19 +179,17 @@ async fn handle_client_fcu(body: &str, state: &State) -> Result<String, Box<dyn 
         };
 
         return Ok(fcu_from_db.set_id(fcu.id)?);
-
     }
 
     // if we're here it means we didn't find the fcu in the db, so just respond SYNCING
     Ok(make_syncing_string(&fcu.id))
-
 }
 
 #[inline(always)]
 async fn handle_client_exchangeconfig(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
     // just try and get the config from the db
     // if we can't just return an error
-    
+
     // json load the body
     let exchange_config = match serde_json::from_str::<exchangeTransitionConfigurationV1>(body) {
         Ok(v) => v,
@@ -191,7 +200,10 @@ async fn handle_client_exchangeconfig(body: &str, state: &State) -> Result<Strin
     };
 
     // get the config from the db
-    let config_from_db = state.db.query_opt("SELECT response FROM exchangeconfig;", &[]).await;
+    let config_from_db = state
+        .db
+        .query_opt("SELECT response FROM exchangeconfig;", &[])
+        .await;
 
     let config_from_db = match config_from_db {
         Ok(v) => v,
@@ -209,7 +221,9 @@ async fn handle_client_exchangeconfig(body: &str, state: &State) -> Result<Strin
     let config_from_db: String = config_from_db.unwrap().get(0);
 
     // parse the config from the db
-    let config_from_db = match serde_json::from_str::<exchangeTransitionConfigurationV1>(&config_from_db) {
+    let config_from_db = match serde_json::from_str::<exchangeTransitionConfigurationV1>(
+        &config_from_db,
+    ) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("Unable to parse exchangeConfig JSON from db: {}", e);
@@ -235,7 +249,13 @@ async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, B
     };
 
     // get the payload from the db
-    let payload_from_db = state.db.query_opt("SELECT response FROM newpayload WHERE request = $1;", &[&new_payload.params.get(0).unwrap().blockHash.to_string()]).await;
+    let payload_from_db = state
+        .db
+        .query_opt(
+            "SELECT response FROM newpayload WHERE request = $1;",
+            &[&new_payload.params.get(0).unwrap().blockHash.to_string()],
+        )
+        .await;
 
     let payload_from_db = match payload_from_db {
         Ok(v) => v,
@@ -251,13 +271,13 @@ async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, B
         let resp_json: newPayloadV1Response = serde_json::from_str(&resp)?;
 
         // if the response is syncing, we save it in the db
-        
+
         match resp_json.result.status {
             ExecutionStatus::VALID => {
                 // save the response in the db
                 let resp_json_fordb = resp_json.clone().to_db()?;
                 state.db.execute("INSERT INTO newpayload (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = $2;;", &[&new_payload.params.get(0).unwrap().blockHash.to_string(), &resp_json_fordb]).await?;
-            },
+            }
             _ => {} // we dont save the response in the db
         }
 
@@ -271,13 +291,11 @@ async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, B
     Ok(payload_from_db.set_id(new_payload.id)?)
 }
 
-
 #[inline(always)]
 async fn handle_passto_auth(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
     // we can just pass these requests to the auth node
 
     Ok(make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?)
-
 }
 
 #[inline(always)]
@@ -285,56 +303,64 @@ async fn handle_passto_unauth(body: &str, state: &State) -> Result<String, Box<d
     // we can just pass these requests to the unauth node
 
     Ok(make_unauth_request(&state.unauth_node, body.to_owned()).await?)
-
 }
-
 
 #[inline(always)]
 async fn handle_canonical_fcu(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
-    // load json 
+    // load json
     let fcu = serde_json::from_str::<forkchoiceUpdatedV2>(body)?;
 
     // make request to auth node
     let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
 
     // load it into a json
-    let resp_json= serde_json::from_str::<forkchoiceUpdatedV1Response>(&resp);
+    let resp_json = serde_json::from_str::<forkchoiceUpdatedV1Response>(&resp);
 
     if let Err(e) = resp_json {
-        tracing::error!("Unable to parse forkchoiceUpdated response JSON from auth node: {}", e);
+        tracing::error!(
+            "Unable to parse forkchoiceUpdated response JSON from auth node: {}",
+            e
+        );
         let mut file = OpenOptions::new().append(true).open("error.log").unwrap();
-        let _ = writeln!(file, "{}", format!("fcu req: {}\nfcu resp: {}\n\n", body, resp));
+        let _ = writeln!(
+            file,
+            "{}",
+            format!("fcu req: {}\nfcu resp: {}\n\n", body, resp)
+        );
         return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot parse forkchoiceUpdated response JSON from auth node\"}}".into());
     }
 
     // insert into db with the headblockhash as the key
     let resp_json = resp_json.unwrap();
-    let resp_json_fordb = resp_json.clone().to_db()?;
-    let req_json_fordb = fcu.clone().to_db()?;
+    let mut resp_fordb = resp_json.clone();
+    resp_fordb.id = 0;
+    let mut req_fordb = fcu.clone();
+    req_fordb.id = 0;
 
     match resp_json.result.payloadStatus.status {
         ExecutionStatus::VALID => {
             // we update the last_legitimate_fcu
             let mut last_legitimate_fcu = state.last_legitimate_fcu.write().await;
-            last_legitimate_fcu.clear();   // clear the vec and then set elem 0 to fcu req and elem 1 to resp
-            last_legitimate_fcu.push(req_json_fordb.clone());
-            last_legitimate_fcu.push(resp_json_fordb.clone());
+            *last_legitimate_fcu = Some(fcu_pair {
+                req: req_fordb.clone(),
+                resp: resp_fordb.clone(),
+            });
             drop(last_legitimate_fcu);
-        },
+        }
         ExecutionStatus::INVALID => {}
-        ExecutionStatus::SYNCING => {},
-        ExecutionStatus::ACCEPTED => {},
-        ExecutionStatus::INVALID_BLOCK_HASH => {},
+        ExecutionStatus::SYNCING => {}
+        ExecutionStatus::ACCEPTED => {}
+        ExecutionStatus::INVALID_BLOCK_HASH => {}
     }
 
-    state.db.execute("INSERT INTO fcu (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = $2;;", &[&req_json_fordb, &resp_json_fordb]).await?;
+    state.db.execute("INSERT INTO fcu (request, response) VALUES ($1, $2) ON CONFLICT (request) DO UPDATE SET response = $2;;", &[&serde_json::to_string(&req_fordb)?, &serde_json::to_string(&resp_fordb)?]).await?;
 
     Ok(resp)
 }
 
 #[inline(always)]
 async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
-    // load json 
+    // load json
     let new_payload = match serde_json::from_str::<newPayloadV2>(body) {
         Ok(v) => v,
         Err(e) => {
@@ -344,7 +370,13 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
     };
 
     // so the non-canonical CL might've already stored the response in the db so just try to get that
-    let payload_from_db = state.db.query_opt("SELECT response FROM newpayload WHERE request = $1;", &[&new_payload.params.get(0).unwrap().blockHash.to_string()]).await;
+    let payload_from_db = state
+        .db
+        .query_opt(
+            "SELECT response FROM newpayload WHERE request = $1;",
+            &[&new_payload.params.get(0).unwrap().blockHash.to_string()],
+        )
+        .await;
 
     let payload_from_db = match payload_from_db {
         Ok(v) => v,
@@ -353,7 +385,6 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
             return Err("{\"error\":{\"code\":-32000,\"message\":\"Cannot get newPayload from db: check openexecution\"}}".into());
         }
     };
-
 
     if !payload_from_db.is_some() {
         // we didn't find the payload in the db, so we forward the request to the auth node and save the resp in the db
@@ -370,7 +401,6 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
 
     // if we're here that means we have a response in the db, so we just load the json set the id and return
 
- 
     let payload_from_db: String = payload_from_db.unwrap().get(0);
     let payload_from_db: newPayloadV1Response = serde_json::from_str(&payload_from_db)?;
 
@@ -378,33 +408,46 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
 }
 
 #[inline(always)]
-async fn handle_canonical_exchangeconfig(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
+async fn handle_canonical_exchangeconfig(
+    body: &str,
+    state: &State,
+) -> Result<String, Box<dyn Error>> {
     // we have to send the exchange config to the auth node and then store the response in the db, always overwriting whatevers in the db
 
     let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
     let resp_json = serde_json::from_str::<exchangeTransitionConfigurationV1>(&resp);
 
     if let Err(e) = resp_json {
-        tracing::error!("Unable to parse exchange config from canonical node JSON: {}", e);
+        tracing::error!(
+            "Unable to parse exchange config from canonical node JSON: {}",
+            e
+        );
         tracing::error!("raw body: {}", body);
         tracing::info!("resp: {}", resp);
-        return Ok(resp)
+        return Ok(resp);
     }
 
     // put in db
     let resp_json = resp_json.unwrap();
     let resp_json_fordb = resp_json.clone().to_db()?;
 
-
     state.db.execute("DELETE FROM exchangeconfig;", &[]).await?;
-    state.db.execute("INSERT INTO exchangeconfig (response) VALUES ($1);", &[&resp_json_fordb]).await?;
-    
+    state
+        .db
+        .execute(
+            "INSERT INTO exchangeconfig (response) VALUES ($1);",
+            &[&resp_json_fordb],
+        )
+        .await?;
+
     Ok(resp)
 }
 
-
 #[inline(always)]
-async fn handle_client_cl(axum::extract::State(state): axum::extract::State<Arc<State>>, body: String) -> impl IntoResponse {
+async fn handle_client_cl(
+    axum::extract::State(state): axum::extract::State<Arc<State>>,
+    body: String,
+) -> impl IntoResponse {
     // load json into a Value
     let json_body: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -444,85 +487,105 @@ async fn handle_client_cl(axum::extract::State(state): axum::extract::State<Arc<
     let method_semi = extract_prefix(method);
 
     match method_semi {
-
-        "engine_" => {
-            match method {
-                "engine_forkchoiceUpdatedV1" | "engine_forkchoiceUpdatedV2" => {
-                    match handle_client_fcu(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle client fcU request: {}; Body: {}", e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
+        "engine_" => match method {
+            "engine_forkchoiceUpdatedV1" | "engine_forkchoiceUpdatedV2" => {
+                match handle_client_fcu(&body, &state).await {
+                    Ok(v) => return (StatusCode::OK, v).into_response(),
+                    Err(e) => {
+                        tracing::error!(
+                            "Unable to handle client fcU request: {}; Body: {}",
+                            e,
+                            body
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                        )
+                            .into_response();
                     }
-                },
-
-                "engine_exchangeTransitionConfigurationV1" => {
-                    match handle_client_exchangeconfig(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle client exchangeConfig request: {}; Body: {}", e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
-                    }
-                },
-                
-                "engine_newPayloadV1" | "engine_newPayloadV2" => {
-                    match handle_client_newpayload(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle client newPayload request: {}; Body: {}", e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
-                    }
-                },
-                
-                "engine_getPayloadV1" |
-                "engine_getPayloadV2" |
-                "engine_getPayloadBodiesByHashV1" |
-                "engine_getPayloadBodiesByRangeV1" |
-                "engine_exchangeCapabilities" => {
-                    match handle_passto_auth(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle client {} request: {}; Body: {}", method, e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
-                    }
-                },
-
-                _ => {
-                    tracing::error!("Unable to match engine method from client request");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "{\"error\":{\"code\":-32000,\"message\":\"Cannot match engine method from body request JSON\"}}",
-                    ).into_response();
                 }
             }
-        },
 
-        "web3_" | "eth_" | "net_" => {
-            match handle_passto_unauth(&body, &state).await {
+            "engine_exchangeTransitionConfigurationV1" => {
+                match handle_client_exchangeconfig(&body, &state).await {
+                    Ok(v) => return (StatusCode::OK, v).into_response(),
+                    Err(e) => {
+                        tracing::error!(
+                            "Unable to handle client exchangeConfig request: {}; Body: {}",
+                            e,
+                            body
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            "engine_newPayloadV1" | "engine_newPayloadV2" => {
+                match handle_client_newpayload(&body, &state).await {
+                    Ok(v) => return (StatusCode::OK, v).into_response(),
+                    Err(e) => {
+                        tracing::error!(
+                            "Unable to handle client newPayload request: {}; Body: {}",
+                            e,
+                            body
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            "engine_getPayloadV1"
+            | "engine_getPayloadV2"
+            | "engine_getPayloadBodiesByHashV1"
+            | "engine_getPayloadBodiesByRangeV1"
+            | "engine_exchangeCapabilities" => match handle_passto_auth(&body, &state).await {
                 Ok(v) => return (StatusCode::OK, v).into_response(),
                 Err(e) => {
-                    tracing::error!("Unable to handle client {} request: {}; Body: {}", method, e, body);
+                    tracing::error!(
+                        "Unable to handle client {} request: {}; Body: {}",
+                        method,
+                        e,
+                        body
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                    ).into_response();
+                    )
+                        .into_response();
                 }
+            },
+
+            _ => {
+                tracing::error!("Unable to match engine method from client request");
+                return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "{\"error\":{\"code\":-32000,\"message\":\"Cannot match engine method from body request JSON\"}}",
+                    ).into_response();
+            }
+        },
+
+        "web3_" | "eth_" | "net_" => match handle_passto_unauth(&body, &state).await {
+            Ok(v) => return (StatusCode::OK, v).into_response(),
+            Err(e) => {
+                tracing::error!(
+                    "Unable to handle client {} request: {}; Body: {}",
+                    method,
+                    e,
+                    body
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                )
+                    .into_response();
             }
         },
 
@@ -534,13 +597,14 @@ async fn handle_client_cl(axum::extract::State(state): axum::extract::State<Arc<
             ).into_response();
         }
     }
-
 }
-
 
 #[inline(always)]
 #[debug_handler]
-async fn handle_canonical_cl(axum::extract::State(state): axum::extract::State<Arc<State>>, body: String) -> impl IntoResponse {
+async fn handle_canonical_cl(
+    axum::extract::State(state): axum::extract::State<Arc<State>>,
+    body: String,
+) -> impl IntoResponse {
     // load json into a Value
     let json_body: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
@@ -580,86 +644,105 @@ async fn handle_canonical_cl(axum::extract::State(state): axum::extract::State<A
     let method_semi = extract_prefix(method);
 
     match method_semi {
-
-        "engine_" => {
-            match method {
-                "engine_forkchoiceUpdatedV1" | "engine_forkchoiceUpdatedV2" => {
-                    match handle_canonical_fcu(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle canonical fcU request: {}; Body: {}", e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
+        "engine_" => match method {
+            "engine_forkchoiceUpdatedV1" | "engine_forkchoiceUpdatedV2" => {
+                match handle_canonical_fcu(&body, &state).await {
+                    Ok(v) => return (StatusCode::OK, v).into_response(),
+                    Err(e) => {
+                        tracing::error!(
+                            "Unable to handle canonical fcU request: {}; Body: {}",
+                            e,
+                            body
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                        )
+                            .into_response();
                     }
-                },
-
-                "engine_exchangeTransitionConfigurationV1" => {
-                    match handle_canonical_exchangeconfig(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle canonical exchangeConfig request: {}; Body: {}", e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
-                    }
-                },
-                
-                "engine_newPayloadV1" | "engine_newPayloadV2" => {
-                    match handle_canonical_newpayload(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle canonical newPayload request: {}; Body: {}", e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
-                    }
-                },
-                
-                "engine_getPayloadV1" |
-                "engine_getPayloadV2" |
-                "engine_getPayloadBodiesByHashV1" |
-                "engine_getPayloadBodiesByRangeV1" |
-                "engine_exchangeCapabilities" => {
-                    match handle_passto_auth(&body, &state).await {
-                        Ok(v) => return (StatusCode::OK, v).into_response(),
-                        Err(e) => {
-                            tracing::error!("Unable to handle canonical {} request: {}; Body: {}", method, e, body);
-                            return (
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                            ).into_response();
-                        }
-                    }
-                },
-
-                _ => {
-                    tracing::error!("Unable to match engine method from canonical request");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "{\"error\":{\"code\":-32000,\"message\":\"Cannot match engine method from body request JSON\"}}",
-                    ).into_response();
-
                 }
             }
-        },
 
-        "web3_" | "eth_" | "net_" => {
-            match handle_passto_unauth(&body, &state).await {
+            "engine_exchangeTransitionConfigurationV1" => {
+                match handle_canonical_exchangeconfig(&body, &state).await {
+                    Ok(v) => return (StatusCode::OK, v).into_response(),
+                    Err(e) => {
+                        tracing::error!(
+                            "Unable to handle canonical exchangeConfig request: {}; Body: {}",
+                            e,
+                            body
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            "engine_newPayloadV1" | "engine_newPayloadV2" => {
+                match handle_canonical_newpayload(&body, &state).await {
+                    Ok(v) => return (StatusCode::OK, v).into_response(),
+                    Err(e) => {
+                        tracing::error!(
+                            "Unable to handle canonical newPayload request: {}; Body: {}",
+                            e,
+                            body
+                        );
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+
+            "engine_getPayloadV1"
+            | "engine_getPayloadV2"
+            | "engine_getPayloadBodiesByHashV1"
+            | "engine_getPayloadBodiesByRangeV1"
+            | "engine_exchangeCapabilities" => match handle_passto_auth(&body, &state).await {
                 Ok(v) => return (StatusCode::OK, v).into_response(),
                 Err(e) => {
-                    tracing::error!("Unable to handle canonical {} request: {}; Body: {}", method, e, body);
+                    tracing::error!(
+                        "Unable to handle canonical {} request: {}; Body: {}",
+                        method,
+                        e,
+                        body
+                    );
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
-                    ).into_response();
+                    )
+                        .into_response();
                 }
+            },
+
+            _ => {
+                tracing::error!("Unable to match engine method from canonical request");
+                return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "{\"error\":{\"code\":-32000,\"message\":\"Cannot match engine method from body request JSON\"}}",
+                    ).into_response();
+            }
+        },
+
+        "web3_" | "eth_" | "net_" => match handle_passto_unauth(&body, &state).await {
+            Ok(v) => return (StatusCode::OK, v).into_response(),
+            Err(e) => {
+                tracing::error!(
+                    "Unable to handle canonical {} request: {}; Body: {}",
+                    method,
+                    e,
+                    body
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{{\"error\":{{\"code\":-32000,\"message\":\"{e}\"}}}}"),
+                )
+                    .into_response();
             }
         },
 
@@ -669,22 +752,22 @@ async fn handle_canonical_cl(axum::extract::State(state): axum::extract::State<A
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "{\"error\":{\"code\":-32000,\"message\":\"Cannot match method from canonical body request JSON\"}}",
             ).into_response();
-        },
-
+        }
     }
-
 }
-
-
 
 #[tokio::main]
 async fn main() {
     let matches = clap::App::new("openexecution")
         .version("0.1.0")
         .author("TennisBowling <tennisbowling@tennisbowling.com>")
-        .about("OpenExecution is a program that lets you control multiple CL's with one canonical CL")
+        .about(
+            "OpenExecution is a program that lets you control multiple CL's with one canonical CL",
+        )
         .setting(clap::AppSettings::ColoredHelp)
-        .long_version("OpenExecution version 0.1.0 by TennisBowling <tennisbowling@tennisbowling.com>")
+        .long_version(
+            "OpenExecution version 0.1.0 by TennisBowling <tennisbowling@tennisbowling.com>",
+        )
         .arg(
             clap::Arg::with_name("port")
                 .long("port")
@@ -773,7 +856,14 @@ async fn main() {
                 .takes_value(true)
                 .required(true),
         )
-    .get_matches();
+        .arg(
+            clap::Arg::with_name("log-file")
+                .long("log-file")
+                .value_name("log-path")
+                .help("Path to log file")
+                .takes_value(true),
+        )
+        .get_matches();
 
     let port = matches.value_of("port").unwrap();
     let jwt_secret = matches.value_of("jwt-secret").unwrap();
@@ -787,7 +877,6 @@ async fn main() {
     let db_name = matches.value_of("db-name").unwrap().to_string();
     let db_port = matches.value_of("db-port").unwrap().to_string();
 
-
     let log_level = match log_level {
         "trace" => tracing::Level::TRACE,
         "debug" => tracing::Level::DEBUG,
@@ -797,11 +886,46 @@ async fn main() {
         _ => tracing::Level::INFO,
     };
     // set log level with tracing subscriber
-    let subscriber = tracing_subscriber::fmt().with_max_level(log_level).finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    // if there's a log file, set it and stdout as the subscriber
+    // if not, just set stdout
+
+    match matches.value_of("log-file") {
+        Some(path) => {
+            let log_file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(path);
+
+            if let Err(e) = log_file {
+                println!("Unable to open log file: {}", e);
+                std::process::exit(1);
+            }
+
+            let log_file = log_file.unwrap();
+
+            let multiwriter = MultiWriter::new(Arc::new(Mutex::new(log_file)));
+
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(log_level)
+                    .finish()
+                    .with(
+                        tracing_subscriber::fmt::Layer::new()
+                            .with_ansi(false)
+                            .with_writer(multiwriter),
+                    ),
+            )
+            .expect("Unable to set global default subscriber")
+        }
+        None => tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt().with_max_level(log_level).finish(),
+        )
+        .expect("Unable to set global default subscriber"),
+    };
+
     tracing::info!("Starting executionbackup version 1.0.2");
-
-
 
     let jwt_secret = std::fs::read_to_string(jwt_secret);
     if let Err(e) = jwt_secret {
@@ -829,22 +953,22 @@ async fn main() {
 
     tracing::info!("Loaded JWT secret");
 
-
-
     let (client, connection) = tokio_postgres::connect(
         &format!(
             "host={} port={} user={} password={} dbname={}",
             db_host, db_port, db_user, db_pass, db_name
         ),
-        tokio_postgres::NoTls
-    ).await.expect("Unable to connect to postgres");
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("Unable to connect to postgres");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
             tracing::error!("Connection error: {}", e);
         }
     });
-    
+
     tracing::info!("Connected to postgres");
 
     // create tables if they don't exist
@@ -859,21 +983,28 @@ async fn main() {
         &[],
     ).await.expect("Unable to create newpayload table");
 
-    client.query(
-        "CREATE TABLE IF NOT EXISTS exchangeconfig (response TEXT NOT NULL);",
-        &[],
-    ).await.expect("Unable to create exchangeconfig table");
+    client
+        .query(
+            "CREATE TABLE IF NOT EXISTS exchangeconfig (response TEXT NOT NULL);",
+            &[],
+        )
+        .await
+        .expect("Unable to create exchangeconfig table");
 
-    
     // make the state
-    let state = Arc::new(State{
+    let state = Arc::new(State {
         db: Arc::new(client),
         jwt_secret: Arc::new(jwt_secret.clone()),
-        auth_node: Arc::new(Node{ client: reqwest::Client::new(), url: node.to_string() }),
-        unauth_node: Arc::new(Node{ client: reqwest::Client::new(), url: unauth_node.to_string() }),
-        last_legitimate_fcu: Arc::new(RwLock::new(Vec::new())),
+        auth_node: Arc::new(Node {
+            client: reqwest::Client::new(),
+            url: node.to_string(),
+        }),
+        unauth_node: Arc::new(Node {
+            client: reqwest::Client::new(),
+            url: unauth_node.to_string(),
+        }),
+        last_legitimate_fcu: Arc::new(RwLock::new(None)),
     });
-
 
     let app: Router = Router::new()
         .route("/", axum::routing::post(handle_client_cl))
@@ -889,14 +1020,10 @@ async fn main() {
     let addr = addr.unwrap();
 
     tracing::info!("Listening on {}", addr);
-    
-    let server = axum::Server::bind(&addr)
-        .serve(app.into_make_service());
+
+    let server = axum::Server::bind(&addr).serve(app.into_make_service());
 
     if let Err(e) = server.await {
         tracing::error!("Server error: {}", e);
     }
-
-
-
 }
