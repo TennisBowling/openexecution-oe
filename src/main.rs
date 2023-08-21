@@ -1,5 +1,5 @@
 mod types;
-use std::{sync::Arc, time::Duration, error::Error, fs::{OpenOptions}};
+use std::{sync::Arc, time::Duration, error::Error, fs::OpenOptions};
 use std::io::Write;
 use serde::{Serialize, Deserialize};
 use types::*;
@@ -54,7 +54,6 @@ async fn make_auth_request(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, node: &A
         .header("Authorization", format!("Bearer {}", jwt))
         .header("Content-Type", "application/json")
         .body(payload)
-        .timeout(Duration::from_millis(2500))
         .send()
         .await?
         .text()
@@ -68,7 +67,6 @@ async fn make_unauth_request(node: &Arc<Node>, payload: String) -> Result<String
         .post(&node.url)
         .header("Content-Type", "application/json")
         .body(payload)
-        .timeout(Duration::from_millis(2500))
         .send()
         .await?
         .text()

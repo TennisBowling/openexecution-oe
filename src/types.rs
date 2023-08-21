@@ -12,7 +12,7 @@ use crate::Node;
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WithdrawlV1 {
+pub struct WithdrawalV1 {
     pub index: String,
     pub validatorIndex: String,
     pub address: String,
@@ -32,7 +32,7 @@ pub struct PayloadAttributesV2 {
     pub timestamp: String,
     pub prevRandao: String,
     pub suggestedFeeRecipient: String,
-    pub withdrawls: Option<Vec<WithdrawlV1>>,
+    pub withdrawals: Option<Vec<WithdrawalV1>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,7 +51,7 @@ pub struct ExecutionPayloadV2 {
     pub baseFeePerGas: String,
     pub blockHash: String,
     pub transactions: Vec<String>,
-    pub withdrawls: Option<Vec<WithdrawlV1>>,
+    pub withdrawals: Option<Vec<WithdrawalV1>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
