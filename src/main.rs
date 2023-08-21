@@ -8,19 +8,11 @@ use axum::{
     self, debug_handler, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse,
     Router,
 };
-use jsonwebtoken;
 use reqwest;
-use serde::{Deserialize, Serialize};
-use std::{
-    error::Error,
-    fs::OpenOptions,
-    io::Write,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
-use types::*;
+
 
 const DEFAULT_ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS256;
 
@@ -34,7 +26,6 @@ pub struct Claims {
     clv: String,
 }
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2500);
 
 #[inline(always)]
 fn make_jwt(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> String {

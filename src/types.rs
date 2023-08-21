@@ -11,13 +11,8 @@ use std::{
 use tokio::sync::RwLock;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
-<<<<<<< HEAD
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WithdrawalV1 {
-=======
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct WithdrawlV1 {
->>>>>>> main
+pub struct WithdrawalV1 {
     pub index: String,
     pub validatorIndex: String,
     pub address: String,
