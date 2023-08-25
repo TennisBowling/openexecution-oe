@@ -1,17 +1,24 @@
 mod types;
 use std::{sync::Arc, time::Duration, error::Error, fs::OpenOptions};
 use std::io::Write;
+use axum::headers::authorization::Bearer;
 use serde::{Serialize, Deserialize};
 use types::*;
-use jsonwebtoken;
+use jsonwebtoken::{self, Validation, DecodingKey};
 use axum::{
-    self, debug_handler, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse,
+    self, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse,
     Router,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::TypedHeader,
+    headers::Authorization,
 };
 use reqwest;
 use std::sync::Mutex;
 use tokio::sync::RwLock;
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
+use futures::{sink::SinkExt, stream::StreamExt};
+use tower_http::trace::{DefaultMakeSpan, TraceLayer};
+
 
 
 const DEFAULT_ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS256;
@@ -594,7 +601,6 @@ async fn handle_client_cl(
 }
 
 #[inline(always)]
-#[debug_handler]
 async fn handle_canonical_cl(
     axum::extract::State(state): axum::extract::State<Arc<State>>,
     body: String,
@@ -746,6 +752,150 @@ async fn handle_canonical_cl(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "{\"error\":{\"code\":-32000,\"message\":\"Cannot match method from canonical body request JSON\"}}",
             ).into_response();
+        }
+    }
+}
+
+
+// called once for the http upgrade
+async fn ws_canonical_handler(
+    TypedHeader(authorization): TypedHeader<Authorization<Bearer>>,
+    axum::extract::State(state): axum::extract::State<Arc<State>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let authorization = authorization.token();
+    let authorization = authorization.replace("Bearer ", "");
+
+    let validation = Validation::new(DEFAULT_ALGORITHM);
+    match jsonwebtoken::decode::<Claims>(&authorization, &DecodingKey::from_secret(&authorization.as_bytes()), &validation) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Unable to decode JWT: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":{\"code\":-32000,\"message\":\"Cannot decode JWT\"}}",
+            ).into_response();
+        }
+    };
+
+    // we check if the canonical header is present
+    // if it is, upgrade to the handle_socket_canonical
+
+    // they have a valid jwt, let them upgrade
+    ws.on_upgrade(move |socket| handle_canonical_socket(axum::extract::State(state), socket))
+    
+}
+
+// called once for the http upgrade
+async fn ws_client_handler(
+    axum::extract::State(state): axum::extract::State<Arc<State>>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+
+    ws.on_upgrade(move |socket| handle_client_socket(axum::extract::State(state), socket))
+    
+}
+
+async fn handle_canonical_socket(axum::extract::State(state): axum::extract::State<Arc<State>>, mut socket: WebSocket) {
+    if !socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
+        // no Error here since the only thing we can do is to close the connection.
+        // If we can not send messages, there is no way to salvage the statemachine anyway.
+        return;
+    }
+
+    let (mut tx, mut rx) = socket.split();
+
+    // we need to continually read from the socket, and send it to the handle_canonical_cl function
+
+    loop {
+        let msg = match rx.next().await {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                tracing::error!("Unable to read from websocket: {}", e);
+                return;
+            }
+            None => {
+                tracing::error!("Unable to read from websocket: None");
+                return;
+            }
+        };
+
+        let msg = match msg {
+            Message::Text(v) => v,
+            Message::Binary(_) => {
+                tracing::error!("Unable to read from websocket: Binary");
+                return;
+            }
+            Message::Ping(_) => {
+                continue;
+            }
+            Message::Pong(_) => {
+                continue;
+            }
+            Message::Close(_) => {
+                return;
+            }
+        };
+
+        let resp = handle_canonical_cl(axum::extract::State(state.clone()), msg).await.into_response();
+        let resp = String::from_utf8_lossy(&hyper::body::to_bytes(resp.into_body()).await.unwrap()).to_string();
+
+        if !tx.send(Message::Text(resp)).await.is_ok() {
+            // no Error here since the only thing we can do is to close the connection.
+            // If we can not send messages, there is no way to salvage the statemachine anyway.
+            return;
+        }
+    }
+}
+
+async fn handle_client_socket(axum::extract::State(state): axum::extract::State<Arc<State>>, mut socket: WebSocket) {
+    if !socket.send(Message::Ping(vec![1, 2, 3])).await.is_ok() {
+        // no Error here since the only thing we can do is to close the connection.
+        // If we can not send messages, there is no way to salvage the statemachine anyway.
+        return;
+    }
+
+    let (mut tx, mut rx) = socket.split();
+
+    // we need to continually read from the socket, and send it to the handle_canonical_cl function
+
+    loop {
+        let msg = match rx.next().await {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
+                tracing::error!("Unable to read from websocket: {}", e);
+                return;
+            }
+            None => {
+                tracing::error!("Unable to read from websocket: None");
+                return;
+            }
+        };
+
+        let msg = match msg {
+            Message::Text(v) => v,
+            Message::Binary(_) => {
+                tracing::error!("Unable to read from websocket: Binary");
+                return;
+            }
+            Message::Ping(_) => {
+                continue;
+            }
+            Message::Pong(_) => {
+                continue;
+            }
+            Message::Close(_) => {
+                return;
+            }
+        };
+
+        let resp = handle_client_cl(axum::extract::State(state.clone()), msg).await.into_response();
+        let resp = String::from_utf8_lossy(&hyper::body::to_bytes(resp.into_body()).await.unwrap()).to_string();
+
+        if !tx.send(Message::Text(resp)).await.is_ok() {
+            // no Error here since the only thing we can do is to close the connection.
+            // If we can not send messages, there is no way to salvage the statemachine anyway.
+            return;
         }
     }
 }
@@ -1003,7 +1153,10 @@ async fn main() {
     let app: Router = Router::new()
         .route("/", axum::routing::post(handle_client_cl))
         .route("/canonical", axum::routing::post(handle_canonical_cl))
+        .route("/ws", axum::routing::get(ws_client_handler))
+        .route("/ws_canonical", axum::routing::get(ws_canonical_handler))
         .with_state(state)
+        .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default().include_headers(true)))
         .layer(DefaultBodyLimit::disable());
 
     let addr = format!("{}:{}", listen_addr, port).parse();
