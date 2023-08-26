@@ -220,7 +220,8 @@ pub enum RequestMethod {
 #[derive(Clone)]
 pub struct State {
     pub db: Arc<tokio_postgres::Client>,
-    pub jwt_secret: Arc<jsonwebtoken::EncodingKey>,
+    pub jwt_encoding_secret: Arc<jsonwebtoken::EncodingKey>,
+    pub jwt_decoding_secret: Arc<jsonwebtoken::DecodingKey>,
     pub auth_node: Arc<Node>,
     pub unauth_node: Arc<Node>,
     pub last_legitimate_fcu: Arc<RwLock<Option<fcu_pair>>>, // first should be req second should be res

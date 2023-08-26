@@ -4,7 +4,7 @@ use std::io::Write;
 use axum::headers::authorization::Bearer;
 use serde::{Serialize, Deserialize};
 use types::*;
-use jsonwebtoken::{self, Validation, DecodingKey};
+use jsonwebtoken::{self, Validation};
 use axum::{
     self, extract::DefaultBodyLimit, http::StatusCode, response::IntoResponse,
     Router,
@@ -27,10 +27,6 @@ const DEFAULT_ALGORITHM: jsonwebtoken::Algorithm = jsonwebtoken::Algorithm::HS25
 pub struct Claims {
     /// issued-at claim. Represented as seconds passed since UNIX_EPOCH.
     iat: i64,
-    /// Optional unique identifier for the CL node.
-    id: String,
-    /// Optional client version for the CL node.
-    clv: String,
 }
 
 
@@ -40,8 +36,6 @@ fn make_jwt(jwt_secret: &Arc<jsonwebtoken::EncodingKey>, timestamp: &i64) -> Str
         &jsonwebtoken::Header::new(DEFAULT_ALGORITHM),
         &Claims {
             iat: timestamp.to_owned(),
-            id: "1".to_owned(),
-            clv: "1".to_owned(),
         },
         &jwt_secret,
     )
@@ -124,7 +118,7 @@ async fn handle_client_fcu(body: &str, state: &State) -> Result<String, Box<dyn 
             if last_fcu.req == fcu_no_payload {
                 // we can just forward this request to the node
                 let resp =
-                    make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+                    make_auth_request(&state.jwt_encoding_secret, &state.auth_node, body.to_owned()).await?;
                 return Ok(resp);
             } else {
                 // return an error since we can't pass a blockbuild request if they have a weird fcu
@@ -268,7 +262,7 @@ async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, B
 
     if !payload_from_db.is_some() {
         // we didn't find the payload in the db, so we forward the request to the auth node
-        let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+        let resp = make_auth_request(&state.jwt_encoding_secret, &state.auth_node, body.to_owned()).await?;
         let resp_json: newPayloadV1Response = serde_json::from_str(&resp)?;
 
         // if the response is syncing, we save it in the db
@@ -296,7 +290,7 @@ async fn handle_client_newpayload(body: &str, state: &State) -> Result<String, B
 async fn handle_passto_auth(body: &str, state: &State) -> Result<String, Box<dyn Error>> {
     // we can just pass these requests to the auth node
 
-    Ok(make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?)
+    Ok(make_auth_request(&state.jwt_encoding_secret, &state.auth_node, body.to_owned()).await?)
 }
 
 #[inline(always)]
@@ -312,7 +306,7 @@ async fn handle_canonical_fcu(body: &str, state: &State) -> Result<String, Box<d
     let fcu = serde_json::from_str::<forkchoiceUpdatedV2>(body)?;
 
     // make request to auth node
-    let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+    let resp = make_auth_request(&state.jwt_encoding_secret, &state.auth_node, body.to_owned()).await?;
 
     // load it into a json
     let resp_json = serde_json::from_str::<forkchoiceUpdatedV1Response>(&resp);
@@ -389,7 +383,7 @@ async fn handle_canonical_newpayload(body: &str, state: &State) -> Result<String
 
     if !payload_from_db.is_some() {
         // we didn't find the payload in the db, so we forward the request to the auth node and save the resp in the db
-        let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+        let resp = make_auth_request(&state.jwt_encoding_secret, &state.auth_node, body.to_owned()).await?;
         let resp_json: newPayloadV1Response = serde_json::from_str(&resp)?;
 
         // put in db
@@ -415,7 +409,7 @@ async fn handle_canonical_exchangeconfig(
 ) -> Result<String, Box<dyn Error>> {
     // we have to send the exchange config to the auth node and then store the response in the db, always overwriting whatevers in the db
 
-    let resp = make_auth_request(&state.jwt_secret, &state.auth_node, body.to_owned()).await?;
+    let resp = make_auth_request(&state.jwt_encoding_secret, &state.auth_node, body.to_owned()).await?;
     let resp_json = serde_json::from_str::<exchangeTransitionConfigurationV1>(&resp);
 
     if let Err(e) = resp_json {
@@ -766,8 +760,10 @@ async fn ws_canonical_handler(
     let authorization = authorization.token();
     let authorization = authorization.replace("Bearer ", "");
 
-    let validation = Validation::new(DEFAULT_ALGORITHM);
-    match jsonwebtoken::decode::<Claims>(&authorization, &DecodingKey::from_secret(&authorization.as_bytes()), &validation) {
+    let mut validation = Validation::new(DEFAULT_ALGORITHM);
+    validation.validate_exp = false;
+    validation.required_spec_claims = Default::default();
+    match jsonwebtoken::decode::<Claims>(&authorization, &state.jwt_decoding_secret, &validation) {
         Ok(v) => v,
         Err(e) => {
             tracing::error!("Unable to decode JWT: {}", e);
@@ -1093,7 +1089,8 @@ async fn main() {
     }
     let jwt_secret = jwt_secret.unwrap();
 
-    let jwt_secret = &jsonwebtoken::EncodingKey::from_secret(&jwt_secret);
+    let jwt_encoding_secret = &jsonwebtoken::EncodingKey::from_secret(&jwt_secret);
+    let jwt_decoding_secret = &jsonwebtoken::DecodingKey::from_secret(&jwt_secret);
 
     tracing::info!("Loaded JWT secret");
 
@@ -1138,7 +1135,8 @@ async fn main() {
     // make the state
     let state = Arc::new(State {
         db: Arc::new(client),
-        jwt_secret: Arc::new(jwt_secret.clone()),
+        jwt_encoding_secret: Arc::new(jwt_encoding_secret.clone()),
+        jwt_decoding_secret: Arc::new(jwt_decoding_secret.clone()),
         auth_node: Arc::new(Node {
             client: reqwest::Client::new(),
             url: node.to_string(),
@@ -1152,9 +1150,9 @@ async fn main() {
 
     let app: Router = Router::new()
         .route("/", axum::routing::post(handle_client_cl))
+        .route("/", axum::routing::get(ws_client_handler))
         .route("/canonical", axum::routing::post(handle_canonical_cl))
-        .route("/ws", axum::routing::get(ws_client_handler))
-        .route("/ws_canonical", axum::routing::get(ws_canonical_handler))
+        .route("/canonical", axum::routing::get(ws_canonical_handler))
         .with_state(state)
         .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default().include_headers(true)))
         .layer(DefaultBodyLimit::disable());
