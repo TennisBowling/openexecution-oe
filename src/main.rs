@@ -1,5 +1,5 @@
 mod types;
-use std::{sync::Arc, time::Duration, error::Error, fs::OpenOptions};
+use std::{sync::Arc, time::Duration, error::Error, fs::OpenOptions, sync::Mutex as StdMutex};
 use std::io::Write;
 use axum::headers::authorization::Bearer;
 use serde::{Serialize, Deserialize};
@@ -13,8 +13,7 @@ use axum::{
     headers::Authorization,
 };
 use reqwest;
-use std::sync::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
 use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;
 use futures::{sink::SinkExt, stream::StreamExt};
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
@@ -799,49 +798,53 @@ async fn handle_canonical_socket(axum::extract::State(state): axum::extract::Sta
         return;
     }
 
-    let (mut tx, mut rx) = socket.split();
+    let (tx, rx) = socket.split();
+    let tx = Arc::new(Mutex::new(tx));
 
     // we need to continually read from the socket, and send it to the handle_canonical_cl function
 
-    loop {
-        let msg = match rx.next().await {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
-                tracing::error!("Unable to read from websocket: {}", e);
-                return;
-            }
-            None => {
-                tracing::error!("Unable to read from websocket: None");
-                return;
-            }
-        };
+    // calling return inside this means we just stop execution for that message
+    rx.for_each_concurrent(None,  move |msg| {
+        let state = state.clone();
+        let tx = tx.clone();
+        async move {
+            let msg =  match msg {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("Unable to read from websocket: {}", e);
+                    return;
+                }
+            };
 
-        let msg = match msg {
-            Message::Text(v) => v,
-            Message::Binary(_) => {
-                tracing::error!("Unable to read from websocket: Binary");
+            let msg = match msg {
+                Message::Text(v) => v,
+                Message::Binary(_) => {
+                    tracing::error!("Unable to read from websocket: Binary");
+                    return;
+                }
+                Message::Ping(_) => {
+                    return;
+                }
+                Message::Pong(_) => {
+                    return;
+                }
+                Message::Close(_) => {
+                    return;
+                }
+            };
+
+            let resp = handle_canonical_cl(axum::extract::State(state), msg).await.into_response();
+            let resp = String::from_utf8_lossy(&hyper::body::to_bytes(resp.into_body()).await.unwrap()).to_string();
+
+            if !tx.lock().await.send(Message::Text(resp)).await.is_ok() {
+                // no Error here since the only thing we can do is to close the connection.
+                // If we can not send messages, there is no way to salvage the statemachine anyway.
                 return;
             }
-            Message::Ping(_) => {
-                continue;
-            }
-            Message::Pong(_) => {
-                continue;
-            }
-            Message::Close(_) => {
-                return;
-            }
-        };
-
-        let resp = handle_canonical_cl(axum::extract::State(state.clone()), msg).await.into_response();
-        let resp = String::from_utf8_lossy(&hyper::body::to_bytes(resp.into_body()).await.unwrap()).to_string();
-
-        if !tx.send(Message::Text(resp)).await.is_ok() {
-            // no Error here since the only thing we can do is to close the connection.
-            // If we can not send messages, there is no way to salvage the statemachine anyway.
-            return;
         }
-    }
+
+    }).await;
+
 }
 
 async fn handle_client_socket(axum::extract::State(state): axum::extract::State<Arc<State>>, mut socket: WebSocket) {
@@ -851,49 +854,53 @@ async fn handle_client_socket(axum::extract::State(state): axum::extract::State<
         return;
     }
 
-    let (mut tx, mut rx) = socket.split();
+    let (tx, rx) = socket.split();
+    let tx = Arc::new(Mutex::new(tx));
 
     // we need to continually read from the socket, and send it to the handle_canonical_cl function
+    // calling return inside this means we just stop execution for that message
 
-    loop {
-        let msg = match rx.next().await {
-            Some(Ok(v)) => v,
-            Some(Err(e)) => {
-                tracing::error!("Unable to read from websocket: {}", e);
+    rx.for_each_concurrent(None,  move |msg| {
+        let state = state.clone();
+        let tx = tx.clone();
+        async move {
+            let msg =  match msg {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!("Unable to read from websocket: {}", e);
+                    return;
+                }
+            };
+
+            let msg = match msg {
+                Message::Text(v) => v,
+                Message::Binary(_) => {
+                    tracing::error!("Unable to read from websocket: Binary");
+                    return;
+                }
+                Message::Ping(_) => {
+                    return;
+                }
+                Message::Pong(_) => {
+                    return;
+                }
+                Message::Close(_) => {
+                    return;
+                }
+            };
+
+            let resp = handle_canonical_cl(axum::extract::State(state), msg).await.into_response();
+            let resp = String::from_utf8_lossy(&hyper::body::to_bytes(resp.into_body()).await.unwrap()).to_string();
+
+            if !tx.lock().await.send(Message::Text(resp)).await.is_ok() {
+                // no Error here since the only thing we can do is to close the connection.
+                // If we can not send messages, there is no way to salvage the statemachine anyway.
                 return;
             }
-            None => {
-                tracing::error!("Unable to read from websocket: None");
-                return;
-            }
-        };
-
-        let msg = match msg {
-            Message::Text(v) => v,
-            Message::Binary(_) => {
-                tracing::error!("Unable to read from websocket: Binary");
-                return;
-            }
-            Message::Ping(_) => {
-                continue;
-            }
-            Message::Pong(_) => {
-                continue;
-            }
-            Message::Close(_) => {
-                return;
-            }
-        };
-
-        let resp = handle_client_cl(axum::extract::State(state.clone()), msg).await.into_response();
-        let resp = String::from_utf8_lossy(&hyper::body::to_bytes(resp.into_body()).await.unwrap()).to_string();
-
-        if !tx.send(Message::Text(resp)).await.is_ok() {
-            // no Error here since the only thing we can do is to close the connection.
-            // If we can not send messages, there is no way to salvage the statemachine anyway.
-            return;
         }
-    }
+
+    }).await;
+
 }
 
 #[tokio::main]
@@ -1045,11 +1052,11 @@ async fn main() {
 
             let log_file = log_file.unwrap();
 
-            let multiwriter = MultiWriter::new(Arc::new(Mutex::new(log_file)));
+            let multiwriter = MultiWriter::new(Arc::new(StdMutex::new(log_file)));
 
             tracing::subscriber::set_global_default(
                 tracing_subscriber::fmt()
-                    .with_max_level(log_level)
+                    .with_max_level(log_level)  
                     .finish()
                     .with(
                         tracing_subscriber::fmt::Layer::new()
