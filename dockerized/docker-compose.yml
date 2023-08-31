@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   open-execution:
-    build: ./openexecution
+    build: .
     platform: linux/amd64
     container_name: openexecution
     restart: unless-stopped
