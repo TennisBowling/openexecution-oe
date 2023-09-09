@@ -1,0 +1,32 @@
+version: "3.9"
+
+services:
+  open-execution:
+    build: .
+    platform: linux/amd64
+    container_name: openexecution
+    restart: unless-stopped
+    env_file: [".env"]
+    depends_on:
+      - open-execution-db
+    volumes:
+      - ./scripts:/scripts
+    ports:
+      - 9091:9091
+    logging:
+      options:
+        max-size: "1g"
+  open-execution-db:
+    container_name: openexecution-db
+    platform: linux/amd64
+    restart: unless-stopped
+    image: postgres:15.4-alpine3.18
+    env_file: [".env"]
+    volumes:
+      - ./data:/var/lib/postgresql/data/
+    ports:
+      - "45432:45432"
+    command: postgres -p 45432
+    logging:
+      options:
+        max-size: "1g"
