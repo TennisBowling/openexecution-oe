@@ -1,5 +1,5 @@
 # openexecution-oe
-Running on mainnet with validators.
+Software that lets you use 1 EL : multiple CL's
 
 # How to build:
 Clone, and then run:
@@ -13,6 +13,7 @@ cargo build --profile highperf
 
 # How to run:
 You'll need a postgreSQL db.  
+  
 Then see these arguments for running:  
 ```
         --db-host <DB host>            Database host ip
@@ -31,11 +32,14 @@ Then see these arguments for running:
 Everything that does not have a default is required.  
 
 # How to use
-Now, just point any CL to the /canonical endpoint of OE, and profit.  
+Now, just point any CL to the endpoint of OE, and profit.  
 Ex.  
 If your running OE with --port 1234, you would pass this to the CL:  
-http://[address]:1234/canonical  
+http://[address]:1234  
 
 Pass any jwt to the client CL it does not matter.
 
-For your controlling CL, simply use the root (/) endpoint of OE. The jwt must be the same for OE as for the EL and CL
+For your controlling CL, simply use the canonical (/canonical) endpoint of OE. The jwt must be the same for OE as for the EL and CL  
+Ex.  
+For your controlling CL, pass this as the execution endpoint:  
+http://[address]:1234/canonical
