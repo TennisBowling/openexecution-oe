@@ -959,7 +959,7 @@ async fn main() {
             clap::Arg::with_name("unauth-node")
                 .long("unauth-node")
                 .value_name("unauth_node")
-                .help("unauth EL node to connect to (for non-engine_ requests)")
+                .help("unauth EL node to connect to (for non-engine_ requests, such as eth_ requests)")
                 .takes_value(true)
                 .required(true),
         )
