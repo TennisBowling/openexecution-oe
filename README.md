@@ -1,4 +1,8 @@
-# openexecution-oe
+## WARNING: DO NOT USE THIS CODE
+This code is not maintained, and cannot follow mainnet.  
+Use the new [openexecution](https://github.com/tennisbowling/openexecution).
+
+## openexecution-oe
 Software that lets you use 1 EL : multiple CL's
 
 # How to build:
