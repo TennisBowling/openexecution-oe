@@ -239,6 +239,10 @@ pub struct Node {
     pub client: reqwest::Client,
 }
 
+pub struct PostgresWriter {
+    
+}
+
 // custom writer that writes to multiple writers
 pub struct MultiWriter<W1> {
     pub writer1: Arc<Mutex<W1>>,
