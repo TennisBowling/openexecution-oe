@@ -1,7 +1,11 @@
-# openexecution-oe
+# WARNING: DO NOT USE THIS CODE
+This code is not maintained, and cannot follow mainnet.  
+Use the new [openexecution](https://github.com/tennisbowling/openexecution).
+
+## openexecution-oe
 Software that lets you use 1 EL : multiple CL's
 
-# How to build:
+## How to build:
 Clone the repo with
 ```
 git clone https://github.com/TennisBowling/openexecution-oe
@@ -22,7 +26,7 @@ cargo build --profile highperf
 Which will build the `openexecution-oe` program at
 `bin/highperf/openexecution-oe`
 
-# How to run:
+## How to run:
 You'll need a postgreSQL db.  
   
 Then see these arguments for running:  
@@ -46,7 +50,7 @@ Example:
 bin/highperf/openexecution-oe --port 5588 --jwt-secret /etc/jwt --unauth-node http://127.0.0.1:8545 --node http://127.0.0.1:8551 --db-host 127.0.0.1 --db-name openexecutiondatabase --db-pass databasepassword --db-port 5432 --db-user openexecution
 ```  
 
-# How to use
+## How to use
 Now, just point any CL to the endpoint of OE, and profit.  
 Ex.  
 If your running OE with --port 5588, you would pass this to the CL:  
